@@ -234,4 +234,223 @@ function App(){
     setNeedWarp(null);
   }
 
-  function applyWarpFinish
+  function applyWarpFinish(p, fromBoard, to, ob, dest, {ghost,clone}){
+    const b=cloneBoards(boards);
+    const tgt=b[ob][dest.r][dest.c];
+    if(tgt && tgt.ghost>0){ alert("幻影は取れません（1ターン後に可）"); return; }
+    b[fromBoard][to.r][to.c]=null;
+    const placed={...p, ghost:(ghost||0), lastMoved:turnNo};
+    b[ob][dest.r][dest.c]=placed;
+    if(clone && !b[fromBoard][to.r][to.c]){ b[fromBoard][to.r][to.c]=makePiece(p.t,p.side,p.promoted); }
+    setBoards(b);
+    return endTurn(`${dispOf(p)} ${fromBoard} r${to.r+1}c${to.c+1} → ワープ ${ob} r${dest.r+1}c${dest.c+1}`);
+  }
+
+  function endTurn(note){
+    setHistory(h=>[...h,note]); setSelected(null); setTargets([]);
+    const next = (turn===S)?G:S; const nextNo = turnNo+1;
+    setTurn(next); setTurnNo(nextNo);
+    setTimeout(()=>beginTurnMaintenance(next),0);
+    setTimeout(()=>endTurnMaintenance(turn),0);
+  }
+
+  function beginTurnMaintenance(side){
+    const b=cloneBoards(boards);
+    // ⏳歩の自動ワープ
+    for(const id of ["A","B"])for(let r=0;r<9;r++)for(let c=0;c<9;c++){
+      const p=b[id][r][c]; if(!p || p.side!==side)continue;
+      if(p.delayedWarp){
+        const ob=otherB(id), d=p.delayedWarp.baseTo;
+        const blocked = collapsedCoords.some(x=>x.r===d.r&&x.c===d.c);
+        if(!blocked){
+          if(!b[ob][d.r][d.c] || (b[ob][d.r][d.c].side!==p.side && b[ob][d.r][d.c].ghost===0)){
+            b[id][r][c]=null; b[ob][d.r][d.c]=p; p.delayedWarp=null; p.lastMoved=turnNo;
+            setHistory(h=>[...h,`⏳歩 自動ワープ: ${id}→${ob} r${d.r+1}c${d.c+1}`]);
+          } else { p.delayedWarp=null; }
+        } else { p.delayedWarp=null; }
+      }
+    }
+    setBoards(b);
+  }
+
+  function endTurnMaintenance(sideJustMoved){
+    const b=cloneBoards(boards);
+    // 幻影ターン減衰
+    for(const id of ["A","B"])for(let r=0;r<9;r++)for(let c=0;c<9;c++){
+      const p=b[id][r][c]; if(p && p.ghost>0 && p.side!==sideJustMoved){ p.ghost=Math.max(0,p.ghost-1); }
+    }
+    // 時間切れ（歩・桂）3ターン → 消滅 → 2ターン後リスポーン
+    const now=turnNo; const sp=[];
+    for(const id of ["A","B"])for(let r=0;r<9;r++)for(let c=0;c<9;c++){
+      const p=b[id][r][c]; if(!p)continue;
+      const idle=(p.lastMoved<0)? now : (now-p.lastMoved);
+      if((p.t==="FU"||p.t==="KE") && idle>=3){
+        b[id][r][c]=null; sp.push({piece:makePiece(p.t,p.side,p.promoted), board:id, sq:{r,c}, due:now+2});
+        setHistory(h=>[...h,`⏱ ${dispOf(p)} 時間切れ消滅 @ ${id} r${r+1}c${c+1}`]);
+      }
+    }
+    // 崩壊マス更新
+    const nc=collapse.map(x=>({sq:x.sq,remain:x.remain-1})).filter(x=>x.remain>0);
+    const fixed=collapse.filter(x=>x.remain-1<=0);
+    for(let i=0;i<fixed.length;i++){
+      const nsq=randSq(); nc.push({sq:nsq,remain:3});
+      for(const id of ["A","B"]){
+        const p=b[id][nsq.r][nsq.c];
+        if(p){ b[id][nsq.r][nsq.c]=null; sp.push({piece:makePiece(p.t,p.side,p.promoted), board:id, sq:{r:nsq.r,c:nsq.c}, due:now+2});
+          setHistory(h=>[...h,`⬛ 崩壊で落下: ${dispOf(p)} @ ${id} r${nsq.r+1}c${nsq.c+1}`]);
+        }
+      }
+    }
+    // 復活試行
+    const fut=[];
+    for(const item of respawns.concat(sp)){
+      if(item.due<=now){
+        const blocked = nc.some(x=>x.sq.r===item.sq.r&&x.sq.c===item.sq.c) || b[item.board][item.sq.r][item.sq.c];
+        if(!blocked){ b[item.board][item.sq.r][item.sq.c]=item.piece; setHistory(h=>[...h,`✳ 復活: ${dispOf(item.piece)} @ ${item.board} r${item.sq.r+1}c${item.sq.c+1}`]); }
+        else fut.push({...item, due:now+1});
+      } else fut.push(item);
+    }
+    setBoards(b); setCollapse(nc); setRespawns(fut);
+  }
+
+  /* ====== 後手AI（固定） ====== */
+  useEffect(()=>{
+    if(turn!==G) return;            // 後手の番だけ
+    if(needWarp||promoAsk) return;   // UIが出てたら待つ
+    const timer=setTimeout(()=>aiStep(), 200);
+    return ()=>clearTimeout(timer);
+  },[turn,needWarp,promoAsk]);
+
+  function aiStep(){
+    // 候補生成
+    const cand=[];
+    for(const id of ["A","B"])for(let r=0;r<9;r++)for(let c=0;c<9;c++){
+      const p=boards[id][r][c]; if(!p||p.side!==G)continue;
+      const ms = genMovesOne(boards,id,r,c);
+      for(const m of ms){
+        if(collapse.some(x=>x.sq.r===m.to.r&&x.sq.c===m.to.c)) continue;
+        const canProm = (["FU","KY","KE","GI","KA","HI"].includes(p.t) && (PROMO_ZONE[p.side].includes(m.to.r)||PROMO_ZONE[p.side].includes(r))) && !p.promoted;
+        cand.push({id,r,c,to:m.to,promote:canProm});
+      }
+    }
+    if(cand.length===0){ setHistory(h=>[...h,"(AI) 指し手なし"]); return; }
+
+    // 簡易評価：取りの価値 + 前進ボーナス + 昇格ボーナス
+    function scoreMove(m){
+      const b=boards, p=b[m.id][m.r][m.c], tgt=b[m.id][m.to.r][m.to.c];
+      let sc = (tgt? PV[tgt.t] : 0) + (p.side===G? (m.to.r - m.r) : 0);
+      if(m.promote) sc += 80; return sc;
+    }
+    let best=-1e18, pick=cand[0];
+    for(const m of cand){ const s=scoreMove(m); if(s>best){best=s; pick=m;} }
+    doMoveAI(pick);
+  }
+
+  function doMoveAI(move){
+    const {id,r,c,to,promote}=move;
+    let b=cloneBoards(boards); const p=b[id][r][c]; if(!p)return;
+    b[id][r][c]=null; b[id][to.r][to.c]=p;
+    if(promote){ p.promoted=true; const ob=otherB(id); if(!b[ob][to.r][to.c]) b[ob][to.r][to.c]=makePiece(p.t,p.side,true); }
+    setBoards(b);
+    // ワープは自動で最優先を選択
+    const warp=warpOptionsForPiece(p,to);
+    const ob=otherB(id);
+    const valid = warp.options.filter(s=>inB(s.r,s.c)).filter(s=>{
+      const t=b[ob][s.r][s.c]; return (!t || t.side!==p.side);
+    }).filter(s=>!collapse.some(x=>x.sq.r===s.r&&x.sq.c===s.c));
+    if(warp.kind==="delay"){ p.delayedWarp={baseTo:to}; return endTurn(`(AI) ${dispOf(p)} ${id} r${to.r+1}c${to.c+1}：遅延ワープ待機`); }
+    if(valid.length===0){ return endTurn(`(AI) ワープ不成立`); }
+    const dest = valid[0];
+    const bb=cloneBoards(boards);
+    const tgt=bb[ob][dest.r][dest.c];
+    if(!(tgt && tgt.ghost>0)){
+      bb[id][to.r][to.c]=null;
+      const placed={...p, ghost:(warp.ghostTurns||0), lastMoved:turnNo};
+      bb[ob][dest.r][dest.c]=placed;
+      if(warp.kind==="clone_both" && !bb[id][to.r][to.c]) bb[id][to.r][to.c]=makePiece(p.t,p.side,p.promoted);
+      setBoards(bb);
+      endTurn(`(AI) ${dispOf(p)} ${id} r${to.r+1}c${to.c+1} → ワープ ${ob} r${dest.r+1}c${dest.c+1}`);
+    } else {
+      endTurn(`(AI) 幻影に阻まれた`);
+    }
+  }
+
+  return (
+    <div className="max-w-screen-md mx-auto space-y-2">
+      <header className="flex items-center justify-between gap-2">
+        <div className="font-bold">Alice Shogi — 時空拡張（二盤・<span class="text-rose-700">後手AI固定</span>）</div>
+        <div className="flex items-center gap-2">
+          <span className="text-sm px-2 py-1 rounded bg-white border">手番：{turn===S?"あなた（先手）":"AI（後手）"}</span>
+          <label className="text-sm flex items-center gap-1">
+            <input type="checkbox" checked={flip} onChange={e=>setFlip(e.target.checked)} />Flip
+          </label>
+          <button className="rounded px-3 py-1 bg-black text-white" onClick={()=>{
+            NEXT_ID=1; setBoards(initBoards()); setTurn(S); setSelected(null); setTargets([]);
+            setHistory([]); setCollapse([{sq:randSq(),remain:3}]); setRespawns([]);
+            setNeedWarp(null); setPromoAsk(null); setTurnNo(1);
+          }}>New</button>
+        </div>
+      </header>
+
+      <div className="grid grid-cols-1 gap-3">
+        <div><div className="font-semibold mb-1">A 盤</div>
+          <Board id="A" grid={boards.A} collapsed={collapsedCoords}
+                 selected={selected&&selected.board==="A"?{r:selected.r,c:selected.c}:null}
+                 targets={selected&&selected.board==="A"?targets:[]}
+                 onClick={(r,c)=>onSquareClick("A",r,c)} flip={flip} />
+        </div>
+        <div><div className="font-semibold mb-1">B 盤</div>
+          <Board id="B" grid={boards.B} collapsed={collapsedCoords}
+                 selected={selected&&selected.board==="B"?{r:selected.r,c:selected.c}:null}
+                 targets={selected&&selected.board==="B"?targets:[]}
+                 onClick={(r,c)=>onSquareClick("B",r,c)} flip={flip} />
+        </div>
+      </div>
+
+      <section className="space-y-1">
+        <div className="text-sm font-semibold">履歴</div>
+        <div className="border rounded p-2 h-40 overflow-auto bg-white/70 text-sm">
+          {history.length? <ol className="list-decimal list-inside space-y-0.5">{history.map((h,i)=><li key={i} className="font-mono">{h}</li>)}</ol>
+          : <div className="opacity-60">No moves yet.</div>}
+        </div>
+        <p className="text-xs text-gray-600">※ベータ：王手/詰み/持ち駒の打ち/二歩などは未実装。AIは簡易評価＆ワープは最優先候補。</p>
+      </section>
+
+      {/* ワープ先選択（あなたの手番のみ） */}
+      {needWarp && (
+        <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center">
+          <div className="bg-white rounded-2xl p-4 shadow-xl w-80">
+            <div className="font-semibold mb-2">ワープ先を選択（相手盤）</div>
+            <div className="grid grid-cols-9 gap-1 text-center text-xs">
+              {rows9.map(rr=>cols9.map(cc=>{
+                const ok=needWarp.options.some(s=>s.r===rr&&s.c===cc);
+                return <button key={rr+':'+cc} disabled={!ok} onClick={()=>chooseWarpDest({r:rr,c:cc})}
+                        className={`h-6 border rounded ${ok?'bg-amber-100 hover:bg-amber-200':'opacity-30'}`}>{(rr+1)+""+(cc+1)}</button>;
+              }))}
+            </div>
+            <button onClick={()=>setNeedWarp(null)} className="mt-3 text-sm text-gray-500 underline">キャンセル</button>
+          </div>
+        </div>
+      )}
+
+      {/* 昇格（あなたの手番のみ） */}
+      {promoAsk && (
+        <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center">
+          <div className="bg-white rounded-2xl p-4 shadow-xl w-64">
+            <div className="font-semibold mb-2">昇格しますか？</div>
+            <div className="flex gap-2">
+              <button onClick={()=>confirmPromotion(true)} className="px-3 py-1.5 rounded bg-black text-white">昇格する</button>
+              <button onClick={()=>confirmPromotion(false)} className="px-3 py-1.5 rounded border">しない</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<App />);
+</script>
+</body>
+</html>
